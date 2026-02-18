@@ -126,6 +126,7 @@ fi
 # Fetch server host key (prevents MITM on first SSH connection)
 # -------------------------------------------------------------------
 echo "🔐 Fetching SSH host key..."
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
 RETRIES=10
 for i in $(seq 1 $RETRIES); do
     HOST_KEY=$(ssh-keyscan -T 10 "$SERVER_IP" 2>/dev/null)

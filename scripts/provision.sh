@@ -13,6 +13,12 @@ if [ -z "$CUSTOMER_EMAIL" ] || [ -z "$CUSTOMER_NAME" ]; then
     exit 1
 fi
 
+# Ensure subdomain is non-empty after sanitization
+if [ -z "$CUSTOMER_SUBDOMAIN" ]; then
+    echo "ERROR: Customer Name '$CUSTOMER_NAME' results in an empty subdomain after sanitization."
+    exit 1
+fi
+
 # Validate email format
 if ! echo "$CUSTOMER_EMAIL" | grep -qE '^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$'; then
     echo "ERROR: Invalid email format: $CUSTOMER_EMAIL"
@@ -73,7 +79,7 @@ fi
 
 echo "Server ID: $SERVER_ID"
 
-# Cleanup function — delete server if provisioning fails
+# Cleanup function — delete server if provisioning fails during setup window
 cleanup() {
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
@@ -139,11 +145,15 @@ fi
 
 # -------------------------------------------------------------------
 # Install OpenClaw on the server (with auth configured)
+# Token is expanded locally via unquoted heredoc delimiter — avoids
+# exposing it in the process list via command-line arguments.
 # -------------------------------------------------------------------
 echo "📥 Installing OpenClaw..."
 
-ssh root@"$SERVER_IP" "GATEWAY_TOKEN='$GATEWAY_TOKEN' bash -s" << 'ENDSSH'
+ssh root@"$SERVER_IP" bash -s <<ENDSSH
 set -eo pipefail
+
+GATEWAY_TOKEN="$GATEWAY_TOKEN"
 
 # Update system (security patches only — skip full upgrade for speed)
 apt-get update -q
@@ -166,7 +176,7 @@ sudo -u openclaw openclaw onboard --install-daemon --non-interactive \
 
 # Set gateway auth token
 sudo -u openclaw openclaw config patch \
-  '{"gateway":{"token":"'"$GATEWAY_TOKEN"'"}}'
+  '{"gateway":{"token":"'\${GATEWAY_TOKEN}'"}}'
 
 echo "✅ Gateway token configured"
 
@@ -177,26 +187,27 @@ systemctl start openclaw-gateway@openclaw
 # Wait for gateway to start
 sleep 5
 
-# Verify auth is required (should return 401 without token)
-AUTH_CHECK=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:18789/health 2>/dev/null || echo "000")
-if [ "$AUTH_CHECK" = "200" ]; then
-    echo "WARNING: Gateway health endpoint is unauthenticated — verify token config"
+# Verify auth is enforced — fatal error if unauthenticated
+AUTH_CHECK=\$(curl -s -o /dev/null -w "%{http_code}" http://localhost:18789/health 2>/dev/null || echo "000")
+if [ "\$AUTH_CHECK" != "401" ]; then
+    echo "ERROR: Gateway auth check failed. Expected HTTP 401, got \$AUTH_CHECK. The gateway may be unauthenticated."
+    exit 1
 fi
+echo "✅ Gateway auth verified (401 on unauthenticated request)"
 
-# Nginx config — proxy only, do not expose raw port
+# Nginx config — proxy only, raw port blocked by firewall
 cat > /etc/nginx/sites-available/openclaw << 'ENDNGINX'
 server {
     listen 80;
     server_name _;
 
-    # Block access to gateway API without token header (defence in depth)
     location / {
         proxy_pass http://localhost:18789;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
-        proxy_cache_bypass $http_upgrade;
+        proxy_set_header Host \$host;
+        proxy_cache_bypass \$http_upgrade;
     }
 }
 ENDNGINX
@@ -215,21 +226,28 @@ ufw --force enable
 echo "✅ OpenClaw installed, authenticated, and firewall configured"
 ENDSSH
 
+# Remote install succeeded — disable cleanup trap for post-provisioning steps
+trap - EXIT
+
 # -------------------------------------------------------------------
-# Verify authentication is working from the outside
+# Verify authentication is enforced from the external network
 # -------------------------------------------------------------------
 echo "🔍 Verifying auth from external network..."
 HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://$SERVER_IP/" 2>/dev/null || echo "000")
-echo "Gateway HTTP status (no token): $HTTP_STATUS"
+if [ "$HTTP_STATUS" != "401" ]; then
+    echo "ERROR: External auth verification failed. Expected HTTP 401, got $HTTP_STATUS from http://$SERVER_IP/"
+    exit 1
+fi
+echo "✅ External auth verified (status: $HTTP_STATUS)"
 
 # -------------------------------------------------------------------
-# Store customer record (no passwords in plaintext)
+# Store customer record — compact JSONL, no credentials
 # -------------------------------------------------------------------
 CUSTOMERS_DB="customers.jsonl"
 touch "$CUSTOMERS_DB"
 chmod 600 "$CUSTOMERS_DB"
 
-jq -n \
+jq -cn \
   --arg name "$CUSTOMER_NAME" \
   --arg email "$CUSTOMER_EMAIL" \
   --arg server_id "$SERVER_ID" \
@@ -289,7 +307,7 @@ Getting Started Guide: https://docs.hosted-claw.com/getting-started
 
 Need help? Reply to this email or join our Discord: https://discord.gg/hosted-claw
 
-Your 7-day trial starts now. You won't be charged until $(date -d "+7 days" +%Y-%m-%d).
+Your 7-day trial starts now.
 
 Welcome aboard! 🚀
 
@@ -299,6 +317,3 @@ ENDEMAIL
 
 echo ""
 echo "✅ Add to UptimeRobot: http://$SERVER_IP"
-
-# Disable trap — provisioning succeeded
-trap - EXIT

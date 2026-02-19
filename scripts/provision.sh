@@ -34,6 +34,11 @@ if [ -z "$HETZNER_SSH_KEY_ID" ]; then
     echo "ERROR: HETZNER_SSH_KEY_ID is not set"
     exit 1
 fi
+if [ -z "$TOKEN_ENCRYPTION_KEY" ]; then
+    echo "ERROR: TOKEN_ENCRYPTION_KEY is not set"
+    echo "  Generate one with: openssl rand -hex 32"
+    exit 1
+fi
 
 echo "🚀 Provisioning Hosted Claw instance for: $CUSTOMER_NAME"
 echo "Email: $CUSTOMER_EMAIL"
@@ -264,15 +269,19 @@ jq -cn \
 echo "📋 Customer record saved to $CUSTOMERS_DB (token NOT stored here)"
 
 # -------------------------------------------------------------------
-# Store token separately with strict permissions
+# Store token encrypted with AES-256-CBC (key from TOKEN_ENCRYPTION_KEY env var)
+# Decrypt with: scripts/get_token.sh <subdomain>
 # -------------------------------------------------------------------
 TOKENS_DIR="tokens"
 mkdir -p "$TOKENS_DIR"
 chmod 700 "$TOKENS_DIR"
-echo "$GATEWAY_TOKEN" > "$TOKENS_DIR/$CUSTOMER_SUBDOMAIN.token"
-chmod 600 "$TOKENS_DIR/$CUSTOMER_SUBDOMAIN.token"
+printf '%s' "$GATEWAY_TOKEN" | \
+  openssl enc -aes-256-cbc -pbkdf2 -iter 100000 \
+    -pass env:TOKEN_ENCRYPTION_KEY \
+    -out "$TOKENS_DIR/$CUSTOMER_SUBDOMAIN.token.enc"
+chmod 600 "$TOKENS_DIR/$CUSTOMER_SUBDOMAIN.token.enc"
 
-echo "🔑 Token saved to $TOKENS_DIR/$CUSTOMER_SUBDOMAIN.token"
+echo "🔑 Token encrypted and saved to $TOKENS_DIR/$CUSTOMER_SUBDOMAIN.token.enc"
 
 # -------------------------------------------------------------------
 # Output summary

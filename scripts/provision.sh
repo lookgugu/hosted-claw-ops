@@ -131,7 +131,7 @@ mkdir -p ~/.ssh && chmod 700 ~/.ssh
 ssh-keygen -R "$SERVER_IP" 2>/dev/null || true
 RETRIES=10
 for i in $(seq 1 $RETRIES); do
-    HOST_KEY=$(ssh-keyscan -T 10 "$SERVER_IP" 2>/dev/null)
+    HOST_KEY=$(ssh-keyscan -T 10 "$SERVER_IP" 2>/dev/null) || true
     if [ -n "$HOST_KEY" ]; then
         echo "$HOST_KEY" >> ~/.ssh/known_hosts
         echo "Host key verified"

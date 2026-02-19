@@ -127,6 +127,8 @@ fi
 # -------------------------------------------------------------------
 echo "🔐 Fetching SSH host key..."
 mkdir -p ~/.ssh && chmod 700 ~/.ssh
+# Remove any stale entry for this IP (Hetzner recycles IPs between customers)
+ssh-keygen -R "$SERVER_IP" 2>/dev/null || true
 RETRIES=10
 for i in $(seq 1 $RETRIES); do
     HOST_KEY=$(ssh-keyscan -T 10 "$SERVER_IP" 2>/dev/null)

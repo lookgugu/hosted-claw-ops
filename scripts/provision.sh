@@ -57,7 +57,7 @@ echo "🔑 Gateway token generated"
 # -------------------------------------------------------------------
 echo "📦 Creating Hetzner VPS..."
 
-HETZNER_RESPONSE=$(curl -s -X POST \
+API_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
   -H "Authorization: Bearer $HETZNER_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d "$(jq -n \
@@ -74,11 +74,20 @@ HETZNER_RESPONSE=$(curl -s -X POST \
     }')" \
   https://api.hetzner.cloud/v1/servers)
 
-SERVER_ID=$(echo "$HETZNER_RESPONSE" | jq -r '.server.id // empty')
+HTTP_CODE=$(echo "$API_RESPONSE" | tail -1)
+RESPONSE_BODY=$(echo "$API_RESPONSE" | sed '$d')
+
+if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+    echo "ERROR: Hetzner API returned HTTP $HTTP_CODE"
+    echo "$RESPONSE_BODY" | jq '.error' 2>/dev/null || echo "$RESPONSE_BODY"
+    exit 1
+fi
+
+SERVER_ID=$(echo "$RESPONSE_BODY" | jq -r '.server.id // empty')
 
 if [ -z "$SERVER_ID" ] || [ "$SERVER_ID" = "null" ]; then
-    echo "ERROR: Failed to create server. Hetzner response:"
-    echo "$HETZNER_RESPONSE" | jq '.error // .'
+    echo "ERROR: Failed to extract server ID from API response"
+    echo "$RESPONSE_BODY" | jq '.' 2>/dev/null || echo "$RESPONSE_BODY"
     exit 1
 fi
 
@@ -165,10 +174,13 @@ GATEWAY_TOKEN="$GATEWAY_TOKEN"
 
 # Update system (security patches only — skip full upgrade for speed)
 apt-get update -q
-apt-get install -y -q --no-install-recommends curl jq nginx certbot python3-certbot-nginx ufw
+apt-get install -y -q --no-install-recommends ca-certificates curl gnupg jq nginx certbot python3-certbot-nginx ufw
 
-# Install Node.js 22
-curl -fsSL https://deb.nodesource.com/setup_22.x | bash - > /dev/null 2>&1
+# Install Node.js 22 from NodeSource APT repo (verified via signed repo)
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
+apt-get update -q
 apt-get install -y -q nodejs
 
 # Install OpenClaw
@@ -203,11 +215,11 @@ if [ "\$AUTH_CHECK" != "401" ]; then
 fi
 echo "✅ Gateway auth verified (401 on unauthenticated request)"
 
-# Nginx config — proxy only, raw port blocked by firewall
+# Nginx config — proxy with proper server_name, raw port blocked by firewall
 cat > /etc/nginx/sites-available/openclaw << 'ENDNGINX'
 server {
     listen 80;
-    server_name _;
+    server_name ${CUSTOMER_SUBDOMAIN}.hosted-claw.com;
 
     location / {
         proxy_pass http://localhost:18789;
@@ -215,6 +227,9 @@ server {
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection 'upgrade';
         proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_cache_bypass \$http_upgrade;
     }
 }
@@ -230,6 +245,13 @@ ufw allow 80/tcp
 ufw allow 443/tcp
 ufw deny 18789/tcp
 ufw --force enable
+
+# Issue SSL certificate (expected to fail if DNS is not yet configured)
+if certbot --nginx -d ${CUSTOMER_SUBDOMAIN}.hosted-claw.com --non-interactive --agree-tos -m ops@hosted-claw.com --redirect; then
+    echo "✅ SSL configured successfully"
+else
+    echo "⚠️  Certbot failed — SSL not configured. Set up DNS first, then run certbot manually."
+fi
 
 echo "✅ OpenClaw installed, authenticated, and firewall configured"
 ENDSSH
@@ -284,6 +306,16 @@ chmod 600 "$TOKENS_DIR/$CUSTOMER_SUBDOMAIN.token.enc"
 echo "🔑 Token encrypted and saved to $TOKENS_DIR/$CUSTOMER_SUBDOMAIN.token.enc"
 
 # -------------------------------------------------------------------
+# Determine dashboard URL (HTTPS if cert exists, HTTP fallback)
+# -------------------------------------------------------------------
+if ssh "root@$SERVER_IP" "test -f /etc/letsencrypt/live/$CUSTOMER_SUBDOMAIN.hosted-claw.com/fullchain.pem" 2>/dev/null; then
+    DASHBOARD_URL="https://$CUSTOMER_SUBDOMAIN.hosted-claw.com"
+else
+    DASHBOARD_URL="http://$CUSTOMER_SUBDOMAIN.hosted-claw.com"
+    echo "⚠️  TLS is not active. Dashboard URL uses HTTP until DNS is configured and certbot succeeds."
+fi
+
+# -------------------------------------------------------------------
 # Output summary
 # -------------------------------------------------------------------
 echo ""
@@ -292,7 +324,8 @@ echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "Customer: $CUSTOMER_NAME"
 echo "Email: $CUSTOMER_EMAIL"
-echo "Dashboard: http://$SERVER_IP"
+echo "Dashboard: $DASHBOARD_URL"
+echo "Server IP: $SERVER_IP"
 echo "Gateway Token: $GATEWAY_TOKEN"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
@@ -306,8 +339,8 @@ Hi $CUSTOMER_NAME,
 
 Your Hosted Claw instance is ready!
 
-🔗 Dashboard: http://$SERVER_IP
-🔑 Gateway Token: $GATEWAY_TOKEN
+Dashboard: $DASHBOARD_URL
+Gateway Token: $GATEWAY_TOKEN
 
 Next steps:
 1. Log in to your dashboard using your gateway token
@@ -328,4 +361,4 @@ Welcome aboard! 🚀
 ENDEMAIL
 
 echo ""
-echo "✅ Add to UptimeRobot: http://$SERVER_IP"
+echo "✅ Add to UptimeRobot: $DASHBOARD_URL"

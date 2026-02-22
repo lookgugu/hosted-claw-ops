@@ -1,0 +1,33 @@
+# Customer data
+customers.csv
+customers.jsonl
+
+# Encrypted tokens
+tokens/
+
+# Environment variables / secrets
+.env
+.env.*
+
+# SSH keys and certificates
+*.pem
+*.key
+*.crt
+*.p12
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Node (if running locally)
+node_modules/
+
+# Logs
+*.log

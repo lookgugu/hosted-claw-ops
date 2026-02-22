@@ -57,7 +57,7 @@ echo "🔑 Gateway token generated"
 # -------------------------------------------------------------------
 echo "📦 Creating Hetzner VPS..."
 
-HETZNER_RESPONSE=$(curl -s -X POST \
+API_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
   -H "Authorization: Bearer $HETZNER_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d "$(jq -n \
@@ -74,11 +74,20 @@ HETZNER_RESPONSE=$(curl -s -X POST \
     }')" \
   https://api.hetzner.cloud/v1/servers)
 
-SERVER_ID=$(echo "$HETZNER_RESPONSE" | jq -r '.server.id // empty')
+HTTP_CODE=$(echo "$API_RESPONSE" | tail -1)
+RESPONSE_BODY=$(echo "$API_RESPONSE" | sed '$d')
+
+if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+    echo "ERROR: Hetzner API returned HTTP $HTTP_CODE"
+    echo "$RESPONSE_BODY" | jq '.error' 2>/dev/null || echo "$RESPONSE_BODY"
+    exit 1
+fi
+
+SERVER_ID=$(echo "$RESPONSE_BODY" | jq -r '.server.id // empty')
 
 if [ -z "$SERVER_ID" ] || [ "$SERVER_ID" = "null" ]; then
-    echo "ERROR: Failed to create server. Hetzner response:"
-    echo "$HETZNER_RESPONSE" | jq '.error // .'
+    echo "ERROR: Failed to extract server ID from API response"
+    echo "$RESPONSE_BODY" | jq '.' 2>/dev/null || echo "$RESPONSE_BODY"
     exit 1
 fi
 
@@ -165,10 +174,13 @@ GATEWAY_TOKEN="$GATEWAY_TOKEN"
 
 # Update system (security patches only — skip full upgrade for speed)
 apt-get update -q
-apt-get install -y -q --no-install-recommends curl jq nginx certbot python3-certbot-nginx ufw
+apt-get install -y -q --no-install-recommends ca-certificates curl gnupg jq nginx certbot python3-certbot-nginx ufw
 
-# Install Node.js 22
-curl -fsSL https://deb.nodesource.com/setup_22.x | bash - > /dev/null 2>&1
+# Install Node.js 22 from NodeSource APT repo (verified via signed repo)
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
+apt-get update -q
 apt-get install -y -q nodejs
 
 # Install OpenClaw
@@ -210,7 +222,7 @@ mkdir -p /etc/nginx/ssl
 if ! openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
   -keyout /etc/nginx/ssl/openclaw.key \
   -out /etc/nginx/ssl/openclaw.crt \
-  -subj "/C=US/ST=State/L=City/O=Hosted Claw/CN=$SERVER_IP" 2>&1; then
+  -subj "/C=US/ST=State/L=City/O=Hosted Claw/CN=${CUSTOMER_SUBDOMAIN}.hosted-claw.com" 2>&1; then
     echo "ERROR: Failed to generate SSL certificate"
     exit 1
 fi
@@ -218,19 +230,19 @@ chmod 600 /etc/nginx/ssl/openclaw.key
 chmod 644 /etc/nginx/ssl/openclaw.crt
 echo "✅ SSL certificate generated successfully"
 
-# Nginx config — HTTPS with HTTP redirect, proxy only, raw port blocked by firewall
-cat > /etc/nginx/sites-available/openclaw << 'ENDNGINX'
+# Nginx config — HTTPS with HTTP redirect, subdomain server_name, proxy only
+cat > /etc/nginx/sites-available/openclaw <<ENDNGINX
 # Redirect HTTP to HTTPS
 server {
     listen 80;
-    server_name _;
-    return 301 https://$host$request_uri;
+    server_name ${CUSTOMER_SUBDOMAIN}.hosted-claw.com;
+    return 301 https://\$host\$request_uri;
 }
 
 # HTTPS server
 server {
     listen 443 ssl;
-    server_name _;
+    server_name ${CUSTOMER_SUBDOMAIN}.hosted-claw.com;
 
     ssl_certificate /etc/nginx/ssl/openclaw.crt;
     ssl_certificate_key /etc/nginx/ssl/openclaw.key;
@@ -255,15 +267,15 @@ server {
     location / {
         proxy_pass http://localhost:18789;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
-        proxy_cache_bypass $http_upgrade;
+        proxy_set_header Host \$host;
+        proxy_cache_bypass \$http_upgrade;
 
         # Forward real client IP
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
     }
 }
 ENDNGINX
@@ -278,6 +290,13 @@ ufw allow 80/tcp
 ufw allow 443/tcp
 ufw deny 18789/tcp
 ufw --force enable
+
+# Issue SSL certificate (expected to fail if DNS is not yet configured)
+if certbot --nginx -d ${CUSTOMER_SUBDOMAIN}.hosted-claw.com --non-interactive --agree-tos -m ops@hosted-claw.com --redirect; then
+    echo "✅ SSL configured successfully"
+else
+    echo "⚠️  Certbot failed — SSL not configured. Set up DNS first, then run certbot manually."
+fi
 
 echo "✅ OpenClaw installed, authenticated, and firewall configured"
 ENDSSH
@@ -347,6 +366,16 @@ chmod 600 "$TOKENS_DIR/$CUSTOMER_SUBDOMAIN.token.enc"
 echo "🔑 Token encrypted and saved to $TOKENS_DIR/$CUSTOMER_SUBDOMAIN.token.enc"
 
 # -------------------------------------------------------------------
+# Determine dashboard URL (HTTPS if cert exists, HTTP fallback)
+# -------------------------------------------------------------------
+if ssh "root@$SERVER_IP" "test -f /etc/letsencrypt/live/$CUSTOMER_SUBDOMAIN.hosted-claw.com/fullchain.pem" 2>/dev/null; then
+    DASHBOARD_URL="https://$CUSTOMER_SUBDOMAIN.hosted-claw.com"
+else
+    DASHBOARD_URL="http://$CUSTOMER_SUBDOMAIN.hosted-claw.com"
+    echo "⚠️  TLS is not active. Dashboard URL uses HTTP until DNS is configured and certbot succeeds."
+fi
+
+# -------------------------------------------------------------------
 # Output summary
 # -------------------------------------------------------------------
 echo ""
@@ -356,6 +385,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "Customer: $CUSTOMER_NAME"
 echo "Email: $CUSTOMER_EMAIL"
 echo "Dashboard: https://$SERVER_IP"
+echo "Server IP: $SERVER_IP"
 echo "Gateway Token: $GATEWAY_TOKEN"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
@@ -372,8 +402,13 @@ Hi $CUSTOMER_NAME,
 
 Your Hosted Claw instance is ready!
 
+<<<<<<< HEAD
 🔗 Dashboard: https://$SERVER_IP
 🔑 Gateway Token: $GATEWAY_TOKEN
+=======
+Dashboard: $DASHBOARD_URL
+Gateway Token: $GATEWAY_TOKEN
+>>>>>>> 398ad86 (Harden provisioning: signed APT repo, nginx subdomain, TLS fallback, HTTP status checks)
 
 ⚠️  Your dashboard uses a self-signed certificate for now. Your browser will show
     a security warning — this is expected. Click "Advanced" then "Proceed" to continue.
@@ -398,4 +433,8 @@ Welcome aboard! 🚀
 ENDEMAIL
 
 echo ""
+<<<<<<< HEAD
 echo "✅ Add to UptimeRobot: https://$SERVER_IP (use HTTPS monitoring)"
+=======
+echo "✅ Add to UptimeRobot: $DASHBOARD_URL"
+>>>>>>> 398ad86 (Harden provisioning: signed APT repo, nginx subdomain, TLS fallback, HTTP status checks)

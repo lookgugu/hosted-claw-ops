@@ -5,15 +5,15 @@ Deployment and operations scripts for [Hosted Claw](https://hosted-claw.com) —
 ## Scripts
 
 ### `scripts/provision.sh`
-Provisions a new customer OpenClaw instance on Hetzner Cloud.
+Provisions a new customer OpenClaw instance on DigitalOcean.
 
 ```bash
 ./scripts/provision.sh customer@email.com "Customer Name"
 ```
 
 **Required env vars:**
-- `HETZNER_API_TOKEN` — Hetzner Cloud API token (Read + Write)
-- `HETZNER_SSH_KEY_ID` — SSH key ID registered in Hetzner
+- `DIGITALOCEAN_API_TOKEN` — DigitalOcean API token (Read + Write)
+- `DIGITALOCEAN_SSH_KEY_ID` — SSH key ID registered in DigitalOcean
 - `TOKEN_ENCRYPTION_KEY` — 32-byte hex key used to encrypt customer tokens at rest
 
 Generate a key:

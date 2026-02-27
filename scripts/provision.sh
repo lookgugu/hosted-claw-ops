@@ -26,12 +26,12 @@ if ! echo "$CUSTOMER_EMAIL" | grep -qE '^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-
 fi
 
 # Validate required env vars
-if [ -z "$HETZNER_API_TOKEN" ]; then
-    echo "ERROR: HETZNER_API_TOKEN is not set"
+if [ -z "$DIGITALOCEAN_API_TOKEN" ]; then
+    echo "ERROR: DIGITALOCEAN_API_TOKEN is not set"
     exit 1
 fi
-if [ -z "$HETZNER_SSH_KEY_ID" ]; then
-    echo "ERROR: HETZNER_SSH_KEY_ID is not set"
+if [ -z "$DIGITALOCEAN_SSH_KEY_ID" ]; then
+    echo "ERROR: DIGITALOCEAN_SSH_KEY_ID is not set"
     exit 1
 fi
 if [ -z "$TOKEN_ENCRYPTION_KEY" ]; then
@@ -53,68 +53,68 @@ GATEWAY_TOKEN=$(openssl rand -hex 32)
 echo "🔑 Gateway token generated"
 
 # -------------------------------------------------------------------
-# Hetzner Cloud API — create VPS
+# DigitalOcean API — create Droplet
 # -------------------------------------------------------------------
-echo "📦 Creating Hetzner VPS..."
+echo "📦 Creating DigitalOcean Droplet..."
 
-HETZNER_RESPONSE=$(curl -s -X POST \
-  -H "Authorization: Bearer $HETZNER_API_TOKEN" \
+DO_RESPONSE=$(curl -s -X POST \
+  -H "Authorization: Bearer $DIGITALOCEAN_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d "$(jq -n \
     --arg name "hosted-claw-$CUSTOMER_SUBDOMAIN" \
     --arg email "$CUSTOMER_EMAIL" \
-    --arg ssh_key "$HETZNER_SSH_KEY_ID" \
+    --arg ssh_key "$DIGITALOCEAN_SSH_KEY_ID" \
     '{
       name: $name,
-      server_type: "cx11",
-      image: "ubuntu-22.04",
-      location: "nbg1",
+      size: "s-1vcpu-1gb",
+      image: "ubuntu-22-04-x64",
+      region: "nyc1",
       ssh_keys: [$ssh_key],
-      labels: { customer_email: $email, service: "hosted-claw" }
+      tags: ["hosted-claw", ("customer:" + $email)]
     }')" \
-  https://api.hetzner.cloud/v1/servers)
+  https://api.digitalocean.com/v2/droplets)
 
-SERVER_ID=$(echo "$HETZNER_RESPONSE" | jq -r '.server.id // empty')
+SERVER_ID=$(echo "$DO_RESPONSE" | jq -r '.droplet.id // empty')
 
 if [ -z "$SERVER_ID" ] || [ "$SERVER_ID" = "null" ]; then
-    echo "ERROR: Failed to create server. Hetzner response:"
-    echo "$HETZNER_RESPONSE" | jq '.error // .'
+    echo "ERROR: Failed to create droplet. DigitalOcean response:"
+    echo "$DO_RESPONSE" | jq '.message // .'
     exit 1
 fi
 
-echo "Server ID: $SERVER_ID"
+echo "Droplet ID: $SERVER_ID"
 
-# Cleanup function — delete server if provisioning fails during setup window
+# Cleanup function — delete droplet if provisioning fails during setup window
 cleanup() {
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
-        echo "⚠️  Provisioning failed (exit $exit_code) — deleting orphaned VPS $SERVER_ID..."
+        echo "⚠️  Provisioning failed (exit $exit_code) — deleting orphaned Droplet $SERVER_ID..."
         curl -s -X DELETE \
-          -H "Authorization: Bearer $HETZNER_API_TOKEN" \
-          "https://api.hetzner.cloud/v1/servers/$SERVER_ID" > /dev/null
-        echo "🗑  VPS $SERVER_ID deleted"
+          -H "Authorization: Bearer $DIGITALOCEAN_API_TOKEN" \
+          "https://api.digitalocean.com/v2/droplets/$SERVER_ID" > /dev/null
+        echo "🗑  Droplet $SERVER_ID deleted"
     fi
 }
 trap cleanup EXIT
 
 # -------------------------------------------------------------------
-# Poll server status until running (up to 3 minutes)
+# Poll droplet status until active (up to 3 minutes)
 # -------------------------------------------------------------------
-echo "⏳ Waiting for server to become active..."
+echo "⏳ Waiting for droplet to become active..."
 MAX_WAIT=180
 ELAPSED=0
 SERVER_IP=""
 
 while [ $ELAPSED -lt $MAX_WAIT ]; do
     STATUS_RESPONSE=$(curl -s \
-      -H "Authorization: Bearer $HETZNER_API_TOKEN" \
-      "https://api.hetzner.cloud/v1/servers/$SERVER_ID")
+      -H "Authorization: Bearer $DIGITALOCEAN_API_TOKEN" \
+      "https://api.digitalocean.com/v2/droplets/$SERVER_ID")
 
-    STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.server.status // empty')
-    SERVER_IP=$(echo "$STATUS_RESPONSE" | jq -r '.server.public_net.ipv4.ip // empty')
+    STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.droplet.status // empty')
+    SERVER_IP=$(echo "$STATUS_RESPONSE" | jq -r '[.droplet.networks.v4[] | select(.type=="public")][0].ip_address // empty')
 
-    if [ "$STATUS" = "running" ] && [ -n "$SERVER_IP" ] && [ "$SERVER_IP" != "null" ]; then
-        echo "Server IP: $SERVER_IP (ready in ${ELAPSED}s)"
+    if [ "$STATUS" = "active" ] && [ -n "$SERVER_IP" ] && [ "$SERVER_IP" != "null" ]; then
+        echo "Droplet IP: $SERVER_IP (ready in ${ELAPSED}s)"
         break
     fi
 
@@ -123,7 +123,7 @@ while [ $ELAPSED -lt $MAX_WAIT ]; do
 done
 
 if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" = "null" ]; then
-    echo "ERROR: Server did not become ready within ${MAX_WAIT}s"
+    echo "ERROR: Droplet did not become ready within ${MAX_WAIT}s"
     exit 1
 fi
 
@@ -132,7 +132,7 @@ fi
 # -------------------------------------------------------------------
 echo "🔐 Fetching SSH host key..."
 mkdir -p ~/.ssh && chmod 700 ~/.ssh
-# Remove any stale entry for this IP (Hetzner recycles IPs between customers)
+# Remove any stale entry for this IP (DigitalOcean recycles IPs between droplets)
 ssh-keygen -R "$SERVER_IP" 2>/dev/null || true
 RETRIES=10
 for i in $(seq 1 $RETRIES); do

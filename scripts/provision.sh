@@ -7,6 +7,7 @@ set -eo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/provider.sh"
 source "$SCRIPT_DIR/lib/retry.sh"
+source "$SCRIPT_DIR/lib/customers.sh"
 
 CUSTOMER_EMAIL=$1
 CUSTOMER_NAME=$2
@@ -136,20 +137,7 @@ echo "✅ External auth verified (status: $HTTP_STATUS)"
 # -------------------------------------------------------------------
 # Store customer record — compact JSONL, no credentials
 # -------------------------------------------------------------------
-CUSTOMERS_DB="customers.jsonl"
-touch "$CUSTOMERS_DB"
-chmod 600 "$CUSTOMERS_DB"
-
-jq -cn \
-  --arg name "$CUSTOMER_NAME" \
-  --arg email "$CUSTOMER_EMAIL" \
-  --arg server_id "$SERVER_ID" \
-  --arg ip "$SERVER_IP" \
-  --arg subdomain "$CUSTOMER_SUBDOMAIN" \
-  --arg status "active" \
-  --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  '{name:$name, email:$email, server_id:$server_id, ip:$ip, subdomain:$subdomain, status:$status, created:$created}' \
-  >> "$CUSTOMERS_DB"
+customer_add "$CUSTOMER_NAME" "$CUSTOMER_EMAIL" "$SERVER_ID" "$SERVER_IP" "$CUSTOMER_SUBDOMAIN"
 
 echo "📋 Customer record saved to $CUSTOMERS_DB (token NOT stored here)"
 

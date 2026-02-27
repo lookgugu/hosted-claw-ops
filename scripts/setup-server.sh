@@ -28,23 +28,25 @@ apt-get install -y -q nodejs
 # Install OpenClaw
 npm install -g openclaw@latest --quiet
 
-# Create openclaw user
-useradd -m -s /bin/bash openclaw
+# Create openclaw user (skip if already exists)
+id openclaw &>/dev/null || useradd -m -s /bin/bash openclaw
 
-# Onboard OpenClaw non-interactively
-sudo -u openclaw openclaw onboard --install-daemon --non-interactive \
-  --model anthropic/claude-sonnet-4-5 \
-  --gateway-port 18789
+# Onboard OpenClaw non-interactively (skip if already onboarded)
+if [ ! -f /home/openclaw/.openclaw/config.json ]; then
+    sudo -u openclaw openclaw onboard --install-daemon --non-interactive \
+      --model anthropic/claude-sonnet-4-5 \
+      --gateway-port 18789
+fi
 
-# Set gateway auth token
+# Set gateway auth token (always update — supports token rotation)
 sudo -u openclaw openclaw config patch \
   '{"gateway":{"token":"'"${GATEWAY_TOKEN}"'"}}'
 
 echo "✅ Gateway token configured"
 
-# Enable and start service
+# Enable and (re)start service — restart is safe on first run too
 systemctl enable openclaw-gateway@openclaw
-systemctl start openclaw-gateway@openclaw
+systemctl restart openclaw-gateway@openclaw
 
 # Wait for gateway to start
 sleep 5
@@ -78,11 +80,11 @@ ln -sf /etc/nginx/sites-available/openclaw /etc/nginx/sites-enabled/
 rm -f /etc/nginx/sites-enabled/default
 nginx -t && systemctl reload nginx
 
-# Firewall — block direct access to gateway port
+# Firewall — block direct access to gateway port (ufw rules are idempotent)
 ufw allow 22/tcp
 ufw allow 80/tcp
 ufw allow 443/tcp
 ufw deny 18789/tcp
-ufw --force enable
+echo "y" | ufw enable
 
 echo "✅ OpenClaw installed, authenticated, and firewall configured"

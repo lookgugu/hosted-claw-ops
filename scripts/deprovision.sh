@@ -9,6 +9,7 @@ set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/provider.sh"
+source "$SCRIPT_DIR/lib/customers.sh"
 
 CUSTOMER_SUBDOMAIN=$1
 
@@ -22,21 +23,13 @@ if [ -z "$DIGITALOCEAN_API_TOKEN" ]; then
     exit 1
 fi
 
-CUSTOMERS_DB="customers.jsonl"
 TOKENS_DIR="tokens"
 
-if [ ! -f "$CUSTOMERS_DB" ]; then
-    echo "ERROR: $CUSTOMERS_DB not found"
-    exit 1
-fi
-
-# Find the customer record
-RECORD=$(grep "\"subdomain\":\"$CUSTOMER_SUBDOMAIN\"" "$CUSTOMERS_DB" | tail -1)
-
-if [ -z "$RECORD" ]; then
+# Find the customer record (uses jq for exact field matching)
+RECORD=$(customer_find "$CUSTOMER_SUBDOMAIN") || {
     echo "ERROR: No customer found with subdomain '$CUSTOMER_SUBDOMAIN'"
     exit 1
-fi
+}
 
 CUSTOMER_NAME=$(echo "$RECORD" | jq -r '.name')
 SERVER_ID=$(echo "$RECORD" | jq -r '.server_id')
@@ -59,11 +52,8 @@ echo "🗑  Deleting droplet $SERVER_ID..."
 provider_delete "$SERVER_ID"
 echo "  Droplet deleted"
 
-# Remove customer record from JSONL (filter out matching subdomain)
-TEMP_DB=$(mktemp)
-grep -v "\"subdomain\":\"$CUSTOMER_SUBDOMAIN\"" "$CUSTOMERS_DB" > "$TEMP_DB" || true
-mv "$TEMP_DB" "$CUSTOMERS_DB"
-chmod 600 "$CUSTOMERS_DB"
+# Remove customer record from JSONL (exact jq field match)
+customer_remove "$CUSTOMER_SUBDOMAIN"
 echo "  Customer record removed from $CUSTOMERS_DB"
 
 # Remove encrypted token

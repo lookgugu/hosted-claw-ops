@@ -4,6 +4,10 @@
 
 set -eo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/lib/provider.sh"
+source "$SCRIPT_DIR/lib/retry.sh"
+
 CUSTOMER_EMAIL=$1
 CUSTOMER_NAME=$2
 CUSTOMER_SUBDOMAIN=$(echo "$CUSTOMER_NAME" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-')
@@ -53,45 +57,19 @@ GATEWAY_TOKEN=$(openssl rand -hex 32)
 echo "🔑 Gateway token generated"
 
 # -------------------------------------------------------------------
-# DigitalOcean API — create Droplet
+# Create droplet
 # -------------------------------------------------------------------
 echo "📦 Creating DigitalOcean Droplet..."
 
-DO_RESPONSE=$(curl -s -X POST \
-  -H "Authorization: Bearer $DIGITALOCEAN_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "$(jq -n \
-    --arg name "hosted-claw-$CUSTOMER_SUBDOMAIN" \
-    --arg email "$CUSTOMER_EMAIL" \
-    --arg ssh_key "$DIGITALOCEAN_SSH_KEY_ID" \
-    '{
-      name: $name,
-      size: "s-1vcpu-1gb",
-      image: "ubuntu-22-04-x64",
-      region: "nyc1",
-      ssh_keys: [$ssh_key],
-      tags: ["hosted-claw", ("customer:" + $email)]
-    }')" \
-  https://api.digitalocean.com/v2/droplets)
-
-SERVER_ID=$(echo "$DO_RESPONSE" | jq -r '.droplet.id // empty')
-
-if [ -z "$SERVER_ID" ] || [ "$SERVER_ID" = "null" ]; then
-    echo "ERROR: Failed to create droplet. DigitalOcean response:"
-    echo "$DO_RESPONSE" | jq '.message // .'
-    exit 1
-fi
-
+SERVER_ID=$(provider_create "hosted-claw-$CUSTOMER_SUBDOMAIN" "$CUSTOMER_EMAIL")
 echo "Droplet ID: $SERVER_ID"
 
-# Cleanup function — delete droplet if provisioning fails during setup window
+# Cleanup function — delete droplet if provisioning fails
 cleanup() {
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
         echo "⚠️  Provisioning failed (exit $exit_code) — deleting orphaned Droplet $SERVER_ID..."
-        curl -s -X DELETE \
-          -H "Authorization: Bearer $DIGITALOCEAN_API_TOKEN" \
-          "https://api.digitalocean.com/v2/droplets/$SERVER_ID" > /dev/null
+        provider_delete "$SERVER_ID"
         echo "🗑  Droplet $SERVER_ID deleted"
     fi
 }
@@ -101,31 +79,14 @@ trap cleanup EXIT
 # Poll droplet status until active (up to 3 minutes)
 # -------------------------------------------------------------------
 echo "⏳ Waiting for droplet to become active..."
-MAX_WAIT=180
-ELAPSED=0
-SERVER_IP=""
 
-while [ $ELAPSED -lt $MAX_WAIT ]; do
-    STATUS_RESPONSE=$(curl -s \
-      -H "Authorization: Bearer $DIGITALOCEAN_API_TOKEN" \
-      "https://api.digitalocean.com/v2/droplets/$SERVER_ID")
-
-    STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.droplet.status // empty')
-    SERVER_IP=$(echo "$STATUS_RESPONSE" | jq -r '[.droplet.networks.v4[] | select(.type=="public")][0].ip_address // empty')
-
-    if [ "$STATUS" = "active" ] && [ -n "$SERVER_IP" ] && [ "$SERVER_IP" != "null" ]; then
-        echo "Droplet IP: $SERVER_IP (ready in ${ELAPSED}s)"
-        break
-    fi
-
-    sleep 5
-    ELAPSED=$((ELAPSED + 5))
-done
-
-if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" = "null" ]; then
-    echo "ERROR: Droplet did not become ready within ${MAX_WAIT}s"
+if ! retry 180 5 provider_is_ready "$SERVER_ID"; then
+    echo "ERROR: Droplet did not become ready within 180s"
     exit 1
 fi
+
+SERVER_IP="$PROVIDER_IP"
+echo "Droplet IP: $SERVER_IP"
 
 # -------------------------------------------------------------------
 # Fetch server host key (prevents MITM on first SSH connection)
@@ -134,105 +95,29 @@ echo "🔐 Fetching SSH host key..."
 mkdir -p ~/.ssh && chmod 700 ~/.ssh
 # Remove any stale entry for this IP (DigitalOcean recycles IPs between droplets)
 ssh-keygen -R "$SERVER_IP" 2>/dev/null || true
-RETRIES=10
-for i in $(seq 1 $RETRIES); do
-    HOST_KEY=$(ssh-keyscan -T 10 "$SERVER_IP" 2>/dev/null) || true
-    if [ -n "$HOST_KEY" ]; then
-        echo "$HOST_KEY" >> ~/.ssh/known_hosts
-        echo "Host key verified"
-        break
-    fi
-    echo "  Attempt $i/$RETRIES — sshd not ready, retrying in 10s..."
-    sleep 10
-done
 
-if [ -z "$HOST_KEY" ]; then
-    echo "ERROR: Could not retrieve host key from $SERVER_IP after $RETRIES attempts"
+fetch_host_key() {
+    HOST_KEY=$(ssh-keyscan -T 10 "$SERVER_IP" 2>/dev/null) || true
+    [ -n "$HOST_KEY" ]
+}
+
+if ! retry 100 10 fetch_host_key; then
+    echo "ERROR: Could not retrieve host key from $SERVER_IP after retries"
     exit 1
 fi
 
+echo "$HOST_KEY" >> ~/.ssh/known_hosts
+echo "Host key verified"
+
 # -------------------------------------------------------------------
-# Install OpenClaw on the server (with auth configured)
-# Token is expanded locally via unquoted heredoc delimiter — avoids
-# exposing it in the process list via command-line arguments.
+# Install OpenClaw on the server
+# Token is passed via env var on the SSH command — the remote script
+# reads it from $GATEWAY_TOKEN, avoiding process-list exposure.
 # -------------------------------------------------------------------
 echo "📥 Installing OpenClaw..."
 
-ssh root@"$SERVER_IP" bash -s <<ENDSSH
-set -eo pipefail
-
-GATEWAY_TOKEN="$GATEWAY_TOKEN"
-
-# Update system (security patches only — skip full upgrade for speed)
-apt-get update -q
-apt-get install -y -q --no-install-recommends curl jq nginx certbot python3-certbot-nginx ufw
-
-# Install Node.js 22
-curl -fsSL https://deb.nodesource.com/setup_22.x | bash - > /dev/null 2>&1
-apt-get install -y -q nodejs
-
-# Install OpenClaw
-npm install -g openclaw@latest --quiet
-
-# Create openclaw user
-useradd -m -s /bin/bash openclaw
-
-# Onboard OpenClaw non-interactively
-sudo -u openclaw openclaw onboard --install-daemon --non-interactive \
-  --model anthropic/claude-sonnet-4-5 \
-  --gateway-port 18789
-
-# Set gateway auth token
-sudo -u openclaw openclaw config patch \
-  '{"gateway":{"token":"'\${GATEWAY_TOKEN}'"}}'
-
-echo "✅ Gateway token configured"
-
-# Enable and start service
-systemctl enable openclaw-gateway@openclaw
-systemctl start openclaw-gateway@openclaw
-
-# Wait for gateway to start
-sleep 5
-
-# Verify auth is enforced — fatal error if unauthenticated
-AUTH_CHECK=\$(curl -s -o /dev/null -w "%{http_code}" http://localhost:18789/health 2>/dev/null || echo "000")
-if [ "\$AUTH_CHECK" != "401" ]; then
-    echo "ERROR: Gateway auth check failed. Expected HTTP 401, got \$AUTH_CHECK. The gateway may be unauthenticated."
-    exit 1
-fi
-echo "✅ Gateway auth verified (401 on unauthenticated request)"
-
-# Nginx config — proxy only, raw port blocked by firewall
-cat > /etc/nginx/sites-available/openclaw << 'ENDNGINX'
-server {
-    listen 80;
-    server_name _;
-
-    location / {
-        proxy_pass http://localhost:18789;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host \$host;
-        proxy_cache_bypass \$http_upgrade;
-    }
-}
-ENDNGINX
-
-ln -sf /etc/nginx/sites-available/openclaw /etc/nginx/sites-enabled/
-rm -f /etc/nginx/sites-enabled/default
-nginx -t && systemctl reload nginx
-
-# Firewall — block direct access to gateway port
-ufw allow 22/tcp
-ufw allow 80/tcp
-ufw allow 443/tcp
-ufw deny 18789/tcp
-ufw --force enable
-
-echo "✅ OpenClaw installed, authenticated, and firewall configured"
-ENDSSH
+ssh -o "SendEnv GATEWAY_TOKEN" root@"$SERVER_IP" \
+  GATEWAY_TOKEN="$GATEWAY_TOKEN" bash -s < "$SCRIPT_DIR/setup-server.sh"
 
 # Remote install succeeded — disable cleanup trap for post-provisioning steps
 trap - EXIT

@@ -220,7 +220,7 @@ cat > /etc/nginx/sites-available/openclaw << 'ENDNGINX'
 server {
     listen 80;
     server_name _;
-    return 301 https://\$host\$request_uri;
+    return 301 https://$host$request_uri;
 }
 
 # HTTPS server
@@ -239,15 +239,15 @@ server {
     location / {
         proxy_pass http://localhost:18789;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection 'upgrade';
-        proxy_set_header Host \$host;
-        proxy_cache_bypass \$http_upgrade;
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
 
         # Forward real client IP
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
 ENDNGINX

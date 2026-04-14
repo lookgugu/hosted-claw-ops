@@ -210,8 +210,7 @@ mkdir -p /etc/nginx/ssl
 openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
   -keyout /etc/nginx/ssl/openclaw.key \
   -out /etc/nginx/ssl/openclaw.crt \
-  -subj "/C=US/ST=State/L=City/O=Hosted Claw/CN=openclaw" \
-  2>/dev/null
+  -subj "/C=US/ST=State/L=City/O=Hosted Claw/CN=$SERVER_IP"
 chmod 600 /etc/nginx/ssl/openclaw.key
 chmod 644 /etc/nginx/ssl/openclaw.crt
 
@@ -234,7 +233,7 @@ server {
 
     # Modern SSL configuration
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
     ssl_prefer_server_ciphers on;
 
     location / {
@@ -275,8 +274,14 @@ trap - EXIT
 # -------------------------------------------------------------------
 echo "🔍 Verifying auth from external network..."
 # Use -k flag to skip certificate verification for self-signed cert
-# Test HTTPS endpoint (HTTP redirects to HTTPS)
-HTTPS_STATUS=$(curl -k -s -o /dev/null -w "%{http_code}" "https://$SERVER_IP/" 2>/dev/null || echo "000")
+# Test HTTPS endpoint (HTTP redirects to HTTPS) with retry for reliability
+HTTPS_STATUS="000"
+for i in {1..5}; do
+    HTTPS_STATUS=$(curl -k -s -o /dev/null -w "%{http_code}" "https://$SERVER_IP/" 2>/dev/null || echo "000")
+    [ "$HTTPS_STATUS" = "401" ] && break
+    echo "  Attempt $i/5 — got status $HTTPS_STATUS, retrying in 2s..."
+    sleep 2
+done
 if [ "$HTTPS_STATUS" != "401" ]; then
     echo "ERROR: External HTTPS auth verification failed. Expected HTTP 401, got $HTTPS_STATUS from https://$SERVER_IP/"
     exit 1

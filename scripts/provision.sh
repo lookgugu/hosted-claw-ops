@@ -207,12 +207,16 @@ echo "✅ Gateway auth verified (401 on unauthenticated request)"
 # Once DNS is implemented (issue #8), this can be replaced with Let's Encrypt
 echo "🔐 Generating self-signed SSL certificate..."
 mkdir -p /etc/nginx/ssl
-openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+if ! openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
   -keyout /etc/nginx/ssl/openclaw.key \
   -out /etc/nginx/ssl/openclaw.crt \
-  -subj "/C=US/ST=State/L=City/O=Hosted Claw/CN=$SERVER_IP"
+  -subj "/C=US/ST=State/L=City/O=Hosted Claw/CN=$SERVER_IP" 2>&1; then
+    echo "ERROR: Failed to generate SSL certificate"
+    exit 1
+fi
 chmod 600 /etc/nginx/ssl/openclaw.key
 chmod 644 /etc/nginx/ssl/openclaw.crt
+echo "✅ SSL certificate generated successfully"
 
 # Nginx config — HTTPS with HTTP redirect, proxy only, raw port blocked by firewall
 cat > /etc/nginx/sites-available/openclaw << 'ENDNGINX'
@@ -231,10 +235,22 @@ server {
     ssl_certificate /etc/nginx/ssl/openclaw.crt;
     ssl_certificate_key /etc/nginx/ssl/openclaw.key;
 
-    # Modern SSL configuration
+    # Hardened SSL configuration
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
-    ssl_prefer_server_ciphers on;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:50m;
+    ssl_session_tickets off;
+
+    # OCSP stapling (not applicable for self-signed, but ready for Let's Encrypt)
+    # ssl_stapling on;
+    # ssl_stapling_verify on;
+
+    # Security headers
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
 
     location / {
         proxy_pass http://localhost:18789;

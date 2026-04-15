@@ -334,8 +334,11 @@ echo "✅ HTTP to HTTPS redirect verified (status: $HTTP_REDIRECT)"
 # Store customer record — compact JSONL, no credentials
 # -------------------------------------------------------------------
 CUSTOMERS_DB="customers.jsonl"
-touch "$CUSTOMERS_DB"
-chmod 600 "$CUSTOMERS_DB"
+
+# Create customers DB with secure permissions (avoid TOCTOU race condition)
+if [ ! -f "$CUSTOMERS_DB" ]; then
+    ( umask 077 && touch "$CUSTOMERS_DB" )
+fi
 
 jq -cn \
   --arg name "$CUSTOMER_NAME" \
@@ -355,13 +358,22 @@ echo "📋 Customer record saved to $CUSTOMERS_DB (token NOT stored here)"
 # Decrypt with: scripts/get_token.sh <subdomain>
 # -------------------------------------------------------------------
 TOKENS_DIR="tokens"
-mkdir -p "$TOKENS_DIR"
-chmod 700 "$TOKENS_DIR"
+
+# Create tokens directory with secure permissions (avoid race condition)
+if [ ! -d "$TOKENS_DIR" ]; then
+    ( umask 077 && mkdir -p "$TOKENS_DIR" )
+fi
+
+# Create encrypted token file with secure permissions atomically
+TOKEN_FILE=$(mktemp -p "$TOKENS_DIR" "${CUSTOMER_SUBDOMAIN}.token.XXXXXX.enc")
+chmod 600 "$TOKEN_FILE"
 printf '%s' "$GATEWAY_TOKEN" | \
   openssl enc -aes-256-cbc -pbkdf2 -iter 100000 \
     -pass env:TOKEN_ENCRYPTION_KEY \
-    -out "$TOKENS_DIR/$CUSTOMER_SUBDOMAIN.token.enc"
-chmod 600 "$TOKENS_DIR/$CUSTOMER_SUBDOMAIN.token.enc"
+    -out "$TOKEN_FILE"
+
+# Move to final location (atomic operation)
+mv "$TOKEN_FILE" "$TOKENS_DIR/$CUSTOMER_SUBDOMAIN.token.enc"
 
 echo "🔑 Token encrypted and saved to $TOKENS_DIR/$CUSTOMER_SUBDOMAIN.token.enc"
 

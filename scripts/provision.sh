@@ -203,19 +203,67 @@ if [ "\$AUTH_CHECK" != "401" ]; then
 fi
 echo "✅ Gateway auth verified (401 on unauthenticated request)"
 
-# Nginx config — proxy only, raw port blocked by firewall
+# Generate self-signed certificate for TLS (interim solution until DNS automation)
+# Once DNS is implemented (issue #8), this can be replaced with Let's Encrypt
+echo "🔐 Generating self-signed SSL certificate..."
+mkdir -p /etc/nginx/ssl
+if ! openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/nginx/ssl/openclaw.key \
+  -out /etc/nginx/ssl/openclaw.crt \
+  -subj "/C=US/ST=State/L=City/O=Hosted Claw/CN=$SERVER_IP" 2>&1; then
+    echo "ERROR: Failed to generate SSL certificate"
+    exit 1
+fi
+chmod 600 /etc/nginx/ssl/openclaw.key
+chmod 644 /etc/nginx/ssl/openclaw.crt
+echo "✅ SSL certificate generated successfully"
+
+# Nginx config — HTTPS with HTTP redirect, proxy only, raw port blocked by firewall
 cat > /etc/nginx/sites-available/openclaw << 'ENDNGINX'
+# Redirect HTTP to HTTPS
 server {
     listen 80;
     server_name _;
+    return 301 https://$host$request_uri;
+}
+
+# HTTPS server
+server {
+    listen 443 ssl;
+    server_name _;
+
+    ssl_certificate /etc/nginx/ssl/openclaw.crt;
+    ssl_certificate_key /etc/nginx/ssl/openclaw.key;
+
+    # Hardened SSL configuration
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:50m;
+    ssl_session_tickets off;
+
+    # OCSP stapling (not applicable for self-signed, but ready for Let's Encrypt)
+    # ssl_stapling on;
+    # ssl_stapling_verify on;
+
+    # Security headers
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
 
     location / {
         proxy_pass http://localhost:18789;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection 'upgrade';
-        proxy_set_header Host \$host;
-        proxy_cache_bypass \$http_upgrade;
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+
+        # Forward real client IP
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
 ENDNGINX
@@ -241,12 +289,27 @@ trap - EXIT
 # Verify authentication is enforced from the external network
 # -------------------------------------------------------------------
 echo "🔍 Verifying auth from external network..."
-HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://$SERVER_IP/" 2>/dev/null || echo "000")
-if [ "$HTTP_STATUS" != "401" ]; then
-    echo "ERROR: External auth verification failed. Expected HTTP 401, got $HTTP_STATUS from http://$SERVER_IP/"
+# Use -k flag to skip certificate verification for self-signed cert
+# Test HTTPS endpoint (HTTP redirects to HTTPS) with retry for reliability
+HTTPS_STATUS="000"
+for i in {1..5}; do
+    HTTPS_STATUS=$(curl -k -s -o /dev/null -w "%{http_code}" "https://$SERVER_IP/" 2>/dev/null || echo "000")
+    [ "$HTTPS_STATUS" = "401" ] && break
+    echo "  Attempt $i/5 — got status $HTTPS_STATUS, retrying in 2s..."
+    sleep 2
+done
+if [ "$HTTPS_STATUS" != "401" ]; then
+    echo "ERROR: External HTTPS auth verification failed. Expected HTTP 401, got $HTTPS_STATUS from https://$SERVER_IP/"
     exit 1
 fi
-echo "✅ External auth verified (status: $HTTP_STATUS)"
+echo "✅ External HTTPS auth verified (status: $HTTPS_STATUS)"
+
+# Verify HTTP redirects to HTTPS
+HTTP_REDIRECT=$(curl -s -o /dev/null -w "%{http_code}" "http://$SERVER_IP/" 2>/dev/null || echo "000")
+if [ "$HTTP_REDIRECT" != "301" ]; then
+    echo "⚠️  Warning: HTTP to HTTPS redirect may not be working. Got status $HTTP_REDIRECT instead of 301"
+fi
+echo "✅ HTTP to HTTPS redirect verified (status: $HTTP_REDIRECT)"
 
 # -------------------------------------------------------------------
 # Store customer record — compact JSONL, no credentials
@@ -292,9 +355,12 @@ echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "Customer: $CUSTOMER_NAME"
 echo "Email: $CUSTOMER_EMAIL"
-echo "Dashboard: http://$SERVER_IP"
+echo "Dashboard: https://$SERVER_IP"
 echo "Gateway Token: $GATEWAY_TOKEN"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "⚠️  Note: Using self-signed certificate (browser warning expected)"
+echo "    Upgrade to Let's Encrypt after DNS automation (issue #8)"
 echo ""
 echo "📧 Send this welcome email to $CUSTOMER_EMAIL:"
 echo ""
@@ -306,8 +372,12 @@ Hi $CUSTOMER_NAME,
 
 Your Hosted Claw instance is ready!
 
-🔗 Dashboard: http://$SERVER_IP
+🔗 Dashboard: https://$SERVER_IP
 🔑 Gateway Token: $GATEWAY_TOKEN
+
+⚠️  Your dashboard uses a self-signed certificate for now. Your browser will show
+    a security warning — this is expected. Click "Advanced" then "Proceed" to continue.
+    We'll upgrade to a trusted certificate when custom domains are available.
 
 Next steps:
 1. Log in to your dashboard using your gateway token
@@ -328,4 +398,4 @@ Welcome aboard! 🚀
 ENDEMAIL
 
 echo ""
-echo "✅ Add to UptimeRobot: http://$SERVER_IP"
+echo "✅ Add to UptimeRobot: https://$SERVER_IP (use HTTPS monitoring)"

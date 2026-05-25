@@ -1,8 +1,18 @@
 # hosted-claw-ops
 
-Deployment and operations scripts for [Hosted Claw](https://hosted-claw.com) — managed OpenClaw hosting.
+Fulfillment engine for [Hosted Claw](https://hosted-claw.com) — managed **Hermes Agent** hosting.
 
-## Scripts
+## Direction
+
+This repo is evolving from a per-VPS Bash provisioner into a **container-per-user control plane**:
+a FastAPI control plane that places per-user Hermes Agent containers onto a shared DigitalOcean
+droplet fleet, with Traefik/Caddy ingress and automatic TLS. See
+[`docs/architecture.md`](docs/architecture.md) for the full blueprint and phased roadmap.
+
+The scripts below are the **current MVP (per-VPS, being superseded)** and still describe how
+provisioning works today.
+
+## Scripts (current MVP — per-VPS, being superseded)
 
 ### `scripts/provision.sh`
 Provisions a new customer OpenClaw instance on Hetzner Cloud.
